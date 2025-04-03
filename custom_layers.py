@@ -335,7 +335,6 @@ class MOELinear(Function):
 
         return grad_inp_buf, None, grad_weight, grad_bias
 
-
 class FMoELinear(nn.Module):
     r"""
     A linear layer that contains multiple experts.

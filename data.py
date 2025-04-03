@@ -36,22 +36,23 @@ class Corpus:
     def __init__(self, data_path):
         self._dictionary = {}
         self.train = _tokenize(
-            text_path=os.path.join(data_path, "train.txt"),
+            text_path=os.path.join(data_path, "wiki.train.raw"),
             dictionary_to_update=self._dictionary,
         )
         self.valid = _tokenize(
-            text_path=os.path.join(data_path, "valid.txt"),
+            text_path=os.path.join(data_path, "wiki.valid.raw"),
             dictionary_to_update=self._dictionary,
         )
         self.test = _tokenize(
-            text_path=os.path.join(data_path, "test.txt"),
+            text_path=os.path.join(data_path, "wiki.test.raw"),
             dictionary_to_update=self._dictionary,
         )
 
     @property
     def vocab_size(self):
         return len(self._dictionary)
-
+        
+torch.serialization.add_safe_globals([Corpus])
 
 def _batchify(data_tensor, batch_size):
     nb_batches = data_tensor.size(0) // batch_size

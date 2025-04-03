@@ -1,11 +1,11 @@
 args="
 --data ./data/wikitext-103/ \
 --base_arch transformer \
---architecture sgsgsg \
+--architecture sfsfsf \
 --gate_name smoe \
 --nlayers 3 \
 --hid-sz 128 \
---inner-hid-sz 128 \
+--inner-hid-sz 2048 \
 --nheads 8 \
 --block-sz 256 \
 --attn-span 256 \
@@ -18,7 +18,7 @@ args="
 --batch-sz 32 \
 --batch-split 2 \
 --nbatches 1000 \
---checkpoint ./ckpt/smoe.pt \
+--checkpoint ./ckpt/smof.pt \
 --full-eval-mode \
 "
 

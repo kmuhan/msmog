@@ -1,11 +1,11 @@
 args="
 --data ./data/wikitext-103/ \
---base_arch transformer \
---architecture sgsgsgsgsgsgsgsgsgsgsgsg \
+--base_arch mog \
+--architecture spspspspspspspspspspspsp \
 --gate_name smoe \
 --nlayers 12 \
 --hid-sz 512 \
---inner-hid-sz 512 \
+--inner-hid-sz 32 \
 --nheads 8 \
 --block-sz 1024 \
 --attn-span 2048 \
@@ -19,7 +19,6 @@ args="
 --batch-split 2 \
 --nbatches 1000 \
 --checkpoint ./ckpt/smog-l.pt \
---full-eval-mode \
 "
 
 # echo "Training ..."

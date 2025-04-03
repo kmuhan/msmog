@@ -3,6 +3,7 @@ import argparse
 import math, random
 import torch
 import tqdm
+import time
 
 from custom_gates import *
 
@@ -158,10 +159,14 @@ def full_eval(model, optimizer, scheduler, data, block_size, hidden_size):
 
     loss_all = 0
     actual_nb_batches_per_iter = 0
+    total_time = 0
     for _ in tqdm.tqdm(range(nb_batches_per_iter_max)):
         actual_nb_batches_per_iter += 1
         X = data[:, train_pos : train_pos + block_size].contiguous()
         Y = data[:, train_pos + 1 : train_pos + block_size + 1].contiguous()
+
+        # calculate time
+        start_time = time.time()
 
         loss, h_cache = _train_batch(
             model=model,
@@ -174,12 +179,19 @@ def full_eval(model, optimizer, scheduler, data, block_size, hidden_size):
             eval_only=True,
             batch_split=1,
         )
+
+        end_time = time.time()
+
+        total_time += end_time - start_time
+        
         loss_all += loss
         train_pos += block_size
         if train_pos >= data.size(1) - block_size:
             # Skip the remaining tokens as it can't make a whole block.
             # An effect on performance should be negligable for a large data.
             break
-
+            
+    print("#####inference time: ", total_time)
+    
     loss_all = loss_all / actual_nb_batches_per_iter
     return loss_all

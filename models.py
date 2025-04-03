@@ -428,7 +428,96 @@ class CustomizedMoEPositionwiseFFOpt(FMoETransformerMLPOpt):
 
         return output
 
+class CustomizedMoGPositionwiseFF(nn.Module):
+    """
+    MoG Positionwise FF
 
+    group_gate: group selection gate
+    mog_num_group: number of groups (16)
+    mog_tok_k: top-k group selection
+
+    self.group_gate: CustomNativeGate_Balance_SMoE
+    self.groups: Modulelist of FF
+    """
+    def __init__(
+        self,
+        gate,
+        group_gate, # gate for group
+        hidden_size,
+        inner_hidden_size,
+        dropout,
+        pre_lnorm=False,
+        moe_num_expert=16,
+        mog_num_group=8, # num_group
+        moe_top_k=2,
+        mog_top_k=2, # mog top-k
+    ):
+        activation = nn.Sequential(nn.ReLU(), nn.Dropout(dropout))
+        super().__init__()
+        self.mog_top_k = mog_top_k
+        self.pre_lnorm = pre_lnorm
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.group_gate = group_gate(
+            d_model=hidden_size,
+            num_expert=mog_num_group,
+            world_size=1,
+            top_k=mog_top_k,
+            g_blance=True,
+        )
+        self.groups = nn.ModuleList([CustomizedMoEPositionwiseFF(
+            gate,
+            hidden_size=hidden_size,
+            inner_hidden_size=inner_hidden_size,
+            dropout=dropout,
+            moe_top_k=moe_top_k,
+        ) for _ in range(mog_num_group)])
+
+    def forward(self, inp):
+        # group_gate: [B, tokens, mog_top_k] 인덱스와 gate_score: [B, tokens, mog_top_k] 반환
+        group_top_k_idx, gate_score = self.group_gate(inp)
+        B, tokens, dim = inp.shape
+        N = B * tokens  # 전체 토큰 수
+
+        # Layer normalization 및 flatten 처리
+        norm_inp = self.layer_norm(inp).view(N, dim)
+        flat_gate_score = gate_score.view(N, self.mog_top_k)           # [N, mog_top_k]
+        flat_expert_ids = group_top_k_idx.view(N, self.mog_top_k)        # [N, mog_top_k]
+
+        # 각 토큰의 top-k 슬롯에 대해 입력을 확장: [N, mog_top_k, dim]
+        expanded_inp = norm_inp.unsqueeze(1).expand(-1, self.mog_top_k, -1)
+        # 이를 한 축으로 합치면: [N * mog_top_k, dim]
+        flat_expanded_inp = expanded_inp.reshape(-1, dim)
+        flat_gate_score = flat_gate_score.reshape(-1)       # [N * mog_top_k]
+        flat_expert_ids = flat_expert_ids.reshape(-1)         # [N * mog_top_k]
+
+        # unique expert id들을 구함 (모든 expert를 반복하지 않고 실제 사용된 expert에 대해서만 loop)
+        unique_experts, inverse_indices = torch.unique(flat_expert_ids, return_inverse=True)
+        # 결과를 저장할 tensor 초기화
+        expert_outputs = torch.zeros_like(flat_expanded_inp)
+
+        # unique expert들에 대해 배치 처리
+        for expert in unique_experts.tolist():
+            mask = flat_expert_ids == expert  # 해당 expert에 할당된 모든 슬롯
+            if mask.sum() == 0:
+                continue
+            inputs_expert = flat_expanded_inp[mask]           # [n, dim]
+            scores_expert = flat_gate_score[mask].unsqueeze(-1)  # [n, 1]
+            # 해당 expert의 feed-forward 연산
+            out_expert = self.groups[expert](inputs_expert)      # [n, dim]
+            # gate score를 곱해 결과 생성
+            expert_outputs[mask] = out_expert * scores_expert
+
+        # 원래 [N, mog_top_k, dim] shape으로 복원 후 top-k에 대해 합산
+        expert_outputs = expert_outputs.view(N, self.mog_top_k, dim)
+        out = expert_outputs.sum(dim=1)  # 각 토큰별 top-k 결과 합산 -> [N, dim]
+
+        # 배치 형태로 복원, dropout 및 residual 연결
+        core_out = out.view(B, tokens, dim)
+        core_out = self.dropout(core_out)
+        return core_out + inp
+
+        
 class TransformerSeqLayer(nn.Module):
     def __init__(
         self,
@@ -438,6 +527,7 @@ class TransformerSeqLayer(nn.Module):
         s,
         g,
         f,
+        p,
         gate_name,
         optimal_policy,
         moe_top_k,
@@ -532,7 +622,22 @@ class TransformerSeqLayer(nn.Module):
                 if g is "a"
                 else None
             )
-
+            self.mog = (
+            CustomizedMoGPositionwiseFF(
+                gate,
+                gate, # gate for group
+                hidden_size,
+                inner_hidden_size,
+                dropout,
+                pre_lnorm=False,
+                moe_num_expert=16,
+                mog_num_group=16, # num_group
+                moe_top_k=2,
+                mog_top_k=2, # mog top-k
+            )
+            if p is "p"
+            else None
+        )
         self.ff = (
             FeedForwardLayer(
                 hidden_size=hidden_size,
@@ -549,6 +654,7 @@ class TransformerSeqLayer(nn.Module):
         self.use_attn = s == "s"
         self.use_smoe = g == "g" or g == "m" or g == "a"
         self.use_ff = f == "f"
+        self.use_mog = p == "p"
         self.g = g
 
     def forward(self, h, h_cache, moment, key_pe):
@@ -563,10 +669,12 @@ class TransformerSeqLayer(nn.Module):
                 smoe_out, moment = self.smoe(h, moment)
             elif self.g == "g":
                 smoe_out = self.smoe(h)
-            h = self.norm2(h + smoe_out)  # B x M x H
-        if self.use_ff:
-            ff_out = self.ff(h)
-            h = self.norm3(h + ff_out)  # B x M x H
+        elif self.use_mog:
+            ##### mog forward
+            smoe_out = self.mog(h)
+        elif self.use_ff:
+            smoe_out = self.ff(h)
+        h = self.norm2(h + smoe_out)  # B x M x H
         return h, moment
 
 
@@ -619,6 +727,39 @@ class TransformerSeq(nn.Module):
                     s=arch[2 * i],
                     g=arch[2 * i + 1],
                     f=None,
+                    p=None,
+                    gate_name=gate_name,
+                    optimal_policy=optimal_policy,
+                    nb_heads=nb_heads,
+                    dropout=dropout,
+                    moe_top_k=moe_top_k,
+                    freq=freq,
+                    alpha=alpha,
+                    act_experts=act_experts,
+                    g_blance=g_blance,
+                    opt_blance=opt_blance,
+                    combine_gate=combine_gate,
+                    opt_loss=opt_loss,
+                    attn_span=attn_span,
+                    gamma1=gamma1,
+                    gamma2=gamma2,
+                    mu=mu,
+                    beta1=beta1,
+                    beta2=beta2,
+                    layerth=i,
+                    **kargs,
+                )
+                for i in range(nb_layers)
+            )
+        elif base_arch == "mog":
+            self.layers.extend(
+                TransformerSeqLayer(
+                    hidden_size=hidden_size,
+                    inner_hidden_size=inner_hidden_size,
+                    s=arch[2 * i],
+                    g=None,
+                    f=None,
+                    p=arch[2 * i + 1],
                     gate_name=gate_name,
                     optimal_policy=optimal_policy,
                     nb_heads=nb_heads,
@@ -652,6 +793,7 @@ class TransformerSeq(nn.Module):
                             s=arch[4 * i],
                             g=arch[4 * i + 1],
                             f=None,
+                            p=None,
                             gate_name=gate_name,
                             optimal_policy=optimal_policy,
                             nb_heads=nb_heads,
@@ -679,6 +821,7 @@ class TransformerSeq(nn.Module):
                             s=arch[4 * i + 2],
                             g=None,
                             f=arch[4 * i + 3],
+                            p=None,
                             gate_name=gate_name,
                             optimal_policy=optimal_policy,
                             nb_heads=nb_heads,
@@ -705,7 +848,7 @@ class TransformerSeq(nn.Module):
 
         else:
             raise RuntimeError(
-                "wrong type of base architecture - must be 'transformer' or 'glam'"
+                "wrong type of base architecture - must be 'transformer' or 'glam' or 'mog'"
             )
 
     def forward(self, x, h_cache):
