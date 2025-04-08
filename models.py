@@ -5,9 +5,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import tqdm
+import tree
+import time
 
 from custom_transformer import FMoETransformerMLP, FMoETransformerMLPOpt
 from custom_gates import *
+from custom_functions import prepare_forward, ensure_comm
+from custom_functions import MOEScatter, MOEGather
 import cmath
 
 
@@ -34,6 +38,62 @@ def _unskew(X):
     X = X.view(B, M, M + L + 1)  # B x M x L+M+1
     X = X[:, :, :L]  # B x M x L
     return X
+
+def _fmog_general_global_forward(
+    inp, gate, group_fn, num_group, world_size, **kwargs
+):
+    r"""
+    A private function that performs the following steps to complete the MoE
+    computation.
+    * Count the number of tokens from each worker to each expert.
+    * Send the features to their target position so that input features to each
+    expert are contiguous in memory.
+    * Perform the forward computation of the experts using `expert_fn`
+    * Gather the output features of experts back, and reorder them as sentences.
+    Intermediate results like expert counts are hidden from users by this
+    function.
+    """
+    (
+        pos,
+        local_group_count,
+        global_group_count,
+        fwd_group_count,
+        fwd_batch_size,
+    ) = prepare_forward(gate, num_group, world_size)
+    topk = 1
+    if len(gate.shape) == 2:
+        topk = gate.shape[1]
+
+    def scatter_func(tensor):
+        return MOEScatter.apply(
+            tensor,
+            torch.div(pos, topk, rounding_mode="floor"),
+            local_group_count,
+            global_group_count,
+            fwd_batch_size,
+            world_size,
+        )
+
+    x = tree.map_structure(scatter_func, inp)
+
+    x = group_fn(x, fwd_group_count)
+
+    out_batch_size = tree.flatten(inp)[0].shape[0]
+    if len(gate.shape) == 2:
+        out_batch_size *= gate.shape[1]
+
+    def gather_func(tensor):
+        return MOEGather.apply(
+            tensor,
+            pos,
+            local_group_count,
+            global_group_count,
+            out_batch_size,
+            world_size,
+        )
+
+    outp = tree.map_structure(gather_func, x)
+    return outp
 
 
 class SeqAttention(nn.Module):
@@ -194,7 +254,7 @@ class CustomizedMoEPositionwiseFF(FMoETransformerMLP):
         inner_hidden_size,
         dropout,
         pre_lnorm=False,
-        moe_num_expert=16,
+        moe_num_expert=128,
         moe_top_k=2,
     ):
         activation = nn.Sequential(nn.ReLU(), nn.Dropout(dropout))
@@ -448,13 +508,15 @@ class CustomizedMoGPositionwiseFF(nn.Module):
         dropout,
         pre_lnorm=False,
         moe_num_expert=16,
-        mog_num_group=8, # num_group
+        mog_num_group=16, # num_group
         moe_top_k=2,
         mog_top_k=2, # mog top-k
     ):
         activation = nn.Sequential(nn.ReLU(), nn.Dropout(dropout))
         super().__init__()
         self.mog_top_k = mog_top_k
+        self.mog_num_group = mog_num_group
+        self.hidden_size = hidden_size
         self.pre_lnorm = pre_lnorm
         self.layer_norm = nn.LayerNorm(hidden_size)
         self.dropout = nn.Dropout(dropout)
@@ -470,53 +532,55 @@ class CustomizedMoGPositionwiseFF(nn.Module):
             hidden_size=hidden_size,
             inner_hidden_size=inner_hidden_size,
             dropout=dropout,
+            moe_num_expert=moe_num_expert,
             moe_top_k=moe_top_k,
         ) for _ in range(mog_num_group)])
 
-    def forward(self, inp):
-        # group_gate: [B, tokens, mog_top_k] 인덱스와 gate_score: [B, tokens, mog_top_k] 반환
-        group_top_k_idx, gate_score = self.group_gate(inp)
-        B, tokens, dim = inp.shape
-        N = B * tokens  # 전체 토큰 수
+    def group_fn(self, inp, fwd_group_count):
+        """
+        The default group function which either calls the experts as a whole
+        or as separate groups.
+        """
+        if isinstance(fwd_group_count, torch.Tensor):
+            fwd_group_count = fwd_group_count.cpu().numpy()
+        outputs = []
+        base_idx = 0
+        for i in range(self.mog_num_group):
+            batch_size = fwd_group_count[i]
+            inp_slice = inp[base_idx : base_idx + batch_size]
+            outputs.append(self.groups[i](inp_slice))
+            base_idx += batch_size
+        return torch.cat(outputs, dim=0)
 
-        # Layer normalization 및 flatten 처리
-        norm_inp = self.layer_norm(inp).view(N, dim)
-        flat_gate_score = gate_score.view(N, self.mog_top_k)           # [N, mog_top_k]
-        flat_expert_ids = group_top_k_idx.view(N, self.mog_top_k)        # [N, mog_top_k]
-
-        # 각 토큰의 top-k 슬롯에 대해 입력을 확장: [N, mog_top_k, dim]
-        expanded_inp = norm_inp.unsqueeze(1).expand(-1, self.mog_top_k, -1)
-        # 이를 한 축으로 합치면: [N * mog_top_k, dim]
-        flat_expanded_inp = expanded_inp.reshape(-1, dim)
-        flat_gate_score = flat_gate_score.reshape(-1)       # [N * mog_top_k]
-        flat_expert_ids = flat_expert_ids.reshape(-1)         # [N * mog_top_k]
-
-        # unique expert id들을 구함 (모든 expert를 반복하지 않고 실제 사용된 expert에 대해서만 loop)
-        unique_experts, inverse_indices = torch.unique(flat_expert_ids, return_inverse=True)
-        # 결과를 저장할 tensor 초기화
-        expert_outputs = torch.zeros_like(flat_expanded_inp)
-
-        # unique expert들에 대해 배치 처리
-        for expert in unique_experts.tolist():
-            mask = flat_expert_ids == expert  # 해당 expert에 할당된 모든 슬롯
-            if mask.sum() == 0:
-                continue
-            inputs_expert = flat_expanded_inp[mask]           # [n, dim]
-            scores_expert = flat_gate_score[mask].unsqueeze(-1)  # [n, 1]
-            # 해당 expert의 feed-forward 연산
-            out_expert = self.groups[expert](inputs_expert)      # [n, dim]
-            # gate score를 곱해 결과 생성
-            expert_outputs[mask] = out_expert * scores_expert
-
-        # 원래 [N, mog_top_k, dim] shape으로 복원 후 top-k에 대해 합산
-        expert_outputs = expert_outputs.view(N, self.mog_top_k, dim)
-        out = expert_outputs.sum(dim=1)  # 각 토큰별 top-k 결과 합산 -> [N, dim]
-
-        # 배치 형태로 복원, dropout 및 residual 연결
-        core_out = out.view(B, tokens, dim)
-        core_out = self.dropout(core_out)
-        return core_out + inp
-
+    def forward(self, mog_inp):
+        # mog_inp: (B, L, D)
+        B, L, D = mog_inp.shape
+        orig = mog_inp               
+        flat_inp = mog_inp.view(-1, D)  # → (B*L, D)
+    
+        gate_top_k_idx, gate_score = self.group_gate(flat_inp)
+        assert gate_top_k_idx.size(0) == flat_inp.size(0), \
+            f"got {gate_top_k_idx.size(0)} vs {flat_inp.size(0)} tokens"
+    
+        fwd = _fmog_general_global_forward(
+            flat_inp,
+            gate_top_k_idx,
+            self.group_fn,
+            self.mog_num_group,
+            world_size=1,
+            groups=self.groups,
+        )
+    
+        fwd = fwd.view(-1, self.mog_top_k, D)
+    
+        gate_score = gate_score.view(-1, 1, self.mog_top_k)
+        out = torch.bmm(gate_score, fwd)   
+        out = out.view(-1, D)         
+    
+        out = out.view(B, L, D)
+    
+        out = self.dropout(out)
+        return self.layer_norm(orig + out)
         
 class TransformerSeqLayer(nn.Module):
     def __init__(
@@ -727,6 +791,38 @@ class TransformerSeq(nn.Module):
                     s=arch[2 * i],
                     g=arch[2 * i + 1],
                     f=None,
+                    p=None,
+                    gate_name=gate_name,
+                    optimal_policy=optimal_policy,
+                    nb_heads=nb_heads,
+                    dropout=dropout,
+                    moe_top_k=moe_top_k,
+                    freq=freq,
+                    alpha=alpha,
+                    act_experts=act_experts,
+                    g_blance=g_blance,
+                    opt_blance=opt_blance,
+                    combine_gate=combine_gate,
+                    opt_loss=opt_loss,
+                    attn_span=attn_span,
+                    gamma1=gamma1,
+                    gamma2=gamma2,
+                    mu=mu,
+                    beta1=beta1,
+                    beta2=beta2,
+                    layerth=i,
+                    **kargs,
+                )
+                for i in range(nb_layers)
+            )
+        elif base_arch == "transformer-f":
+            self.layers.extend(
+                TransformerSeqLayer(
+                    hidden_size=hidden_size,
+                    inner_hidden_size=inner_hidden_size,
+                    s=arch[2 * i],
+                    g=None,
+                    f=arch[2 * i + 1],
                     p=None,
                     gate_name=gate_name,
                     optimal_policy=optimal_policy,

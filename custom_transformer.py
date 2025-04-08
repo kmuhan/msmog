@@ -8,6 +8,23 @@ from custom_layers import FMoELinear
 from custom_layers_opt import FMoEOpt
 
 
+class NaiveExpert(nn.Module):
+    """
+    An custom expert for naive implementation
+    """
+
+    def __init__(self, d_model, d_hidden, activation):
+        super().__init__()
+        self.htoh4 = nn.Linear(d_model, d_hidden)
+        self.h4toh = nn.Linear(d_hidden, d_model)
+        self.activation = activation
+
+    def forward(self, inp):
+        x = self.htoh4(inp)
+        x = self.activation(x)
+        x = self.h4toh(x)
+        return x
+
 class _Expert(nn.Module):
     r"""
     An expert using 2 FMoELinear modules to speed up the computation of experts
@@ -50,11 +67,9 @@ class FMoETransformerMLP(FMoE):
         **kwargs
     ):
         super().__init__(
-            num_expert=num_expert, d_model=d_model, moe_top_k=moe_top_k, **kwargs
+            num_expert=num_expert, d_model=d_model, moe_top_k=moe_top_k, expert=NaiveExpert, **kwargs
         )
-        self.experts = _Expert(
-            num_expert, d_model, d_hidden, activation, rank=expert_rank
-        )
+        self.experts = nn.ModuleList([NaiveExpert(d_model, d_hidden, activation) for _ in range(num_expert)])
         self.mark_parallel_comm(expert_dp_comm)
 
     def forward(self, inp: torch.Tensor):

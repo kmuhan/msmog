@@ -142,6 +142,50 @@ def train_iteration(
     loss_all = loss_all / actual_nb_batches_per_iter
     return loss_all, train_pos, h_cache
 
+from ptflops import get_model_complexity_info
+
+def get_flops_and_params(model, batch_size, block_size, hidden_size, device="cuda"):
+    """
+    model: nn.Module (wrapped with DDP or not)
+    batch_size: int
+    block_size: int (sequence length)
+    hidden_size: int
+    device: str ("cuda" or "cpu")
+    """
+    model.eval()
+    model = model.module if hasattr(model, "module") else model
+
+    # Dummy inputs (X, h_cache)
+    X = torch.zeros(batch_size, block_size).long().to(device)
+
+    h_cache = [
+        torch.zeros(
+            batch_size,
+            model.layers[layer_i].attn.attn.get_cache_size(),
+            hidden_size
+        ).to(device)
+        for layer_i in range(model.attn_layer_count)
+    ]
+
+    def input_constructor(input_res):
+        return (X, h_cache)
+
+    input_shape = (block_size,)  # sequence length only
+
+    with torch.cuda.device(0 if device == "cuda" else -1):
+        macs, params = get_model_complexity_info(
+            model,
+            input_res=input_shape,
+            input_constructor=input_constructor,
+            as_strings=True,
+            print_per_layer_stat=False,
+            verbose=False,
+        )
+
+    print(f"##### FLOPs: {macs}")
+    print(f"##### Params: {params}")
+    return macs, params
+
 
 # do full evaluation
 def full_eval(model, optimizer, scheduler, data, block_size, hidden_size):
@@ -160,6 +204,8 @@ def full_eval(model, optimizer, scheduler, data, block_size, hidden_size):
     loss_all = 0
     actual_nb_batches_per_iter = 0
     total_time = 0
+    flops_printed = False
+    
     for _ in tqdm.tqdm(range(nb_batches_per_iter_max)):
         actual_nb_batches_per_iter += 1
         X = data[:, train_pos : train_pos + block_size].contiguous()
@@ -167,6 +213,45 @@ def full_eval(model, optimizer, scheduler, data, block_size, hidden_size):
 
         # calculate time
         start_time = time.time()
+
+        if not flops_printed:
+            try:
+                with torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                    with_flops=True,
+                    profile_memory=True,
+                    record_shapes=True
+                ) as prof:
+                    with torch.no_grad():
+                        _ = model.module(X, h_cache)
+
+                # 전체 FLOPs
+                total_flops = sum([evt.flops for evt in prof.key_averages() if evt.flops is not None])
+                print(f"\n##### Total FLOPs (per forward pass): {total_flops / 1e9:.3f} GFLOPs")
+
+                # top 연산 기준 출력
+                print("\n##### FLOPs and time (Top 10 ops by FLOPs):")
+                print(prof.key_averages().table(
+                    sort_by="self_cuda_time_total", row_limit=10
+                ))
+
+                # layer별 FLOPs 정리
+                from collections import defaultdict
+                flops_per_op = defaultdict(float)
+                for evt in prof.key_averages():
+                    if evt.flops is not None:
+                        flops_per_op[evt.key] += evt.cuda_time_total
+
+                print("\n##### FLOPs per operator (in GFLOPs):")
+                for key, flops in sorted(flops_per_op.items(), key=lambda x: -x[1]):
+                    print(f"{key:40s}: {flops / 1e9:.3f} GFLOPs")
+
+                flops_printed = True
+
+            except Exception as e:
+                print("##### FLOPs estimation failed due to:")
+                print(f"{type(e)} : {e}")
+                flops_printed = True
 
         loss, h_cache = _train_batch(
             model=model,
@@ -183,15 +268,15 @@ def full_eval(model, optimizer, scheduler, data, block_size, hidden_size):
         end_time = time.time()
 
         total_time += end_time - start_time
-        
+
         loss_all += loss
         train_pos += block_size
         if train_pos >= data.size(1) - block_size:
             # Skip the remaining tokens as it can't make a whole block.
             # An effect on performance should be negligable for a large data.
             break
-            
+
     print("#####inference time: ", total_time)
-    
+
     loss_all = loss_all / actual_nb_batches_per_iter
     return loss_all

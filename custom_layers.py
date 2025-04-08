@@ -140,7 +140,7 @@ class FMoE(nn.Module):
             self.experts_fused = False
             self.num_expert = num_expert = len(expert)
         elif expert is not None:
-            self.experts = nn.ModuleList([expert(d_model) for _ in range(num_expert)])
+            # self.experts = nn.ModuleList([expert(d_model) for _ in range(num_expert)])
             self.experts_fused = False
         else:
             self.experts_fused = True
@@ -194,6 +194,7 @@ class FMoE(nn.Module):
         moe_inp_batch_size = tree.flatten(
             tree.map_structure(lambda tensor: tensor.shape[0], moe_inp)
         )
+        
         assert all(
             [batch_size == moe_inp_batch_size[0] for batch_size in moe_inp_batch_size]
         ), "MoE inputs must have the same batch size"
@@ -207,13 +208,13 @@ class FMoE(nn.Module):
         if self.slice_size > 1:
 
             def slice_func(tensor):
-                return Slice.apply(
-                    tensor, self.slice_rank, self.slice_size, self.slice_group
-                )
+                out = Slice.apply(tensor, self.slice_rank, self.slice_size, self.slice_group)
+                return out
 
             moe_inp = tree.map_structure(slice_func, moe_inp)
 
-        gate_top_k_idx, gate_score = self.gate(moe_inp)
+        with torch.profiler.record_function("ExpertGate"):
+            gate_top_k_idx, gate_score = self.gate(moe_inp)
 
         if hasattr(self.gate, "dynamic_top_k"):
             self.top_k = self.gate.dynamic_top_k
